@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import random
 import xmlrpc.client
 from http.server import BaseHTTPRequestHandler
@@ -16,7 +17,6 @@ TYPECHO_PASSWORD = os.environ.get("TYPECHO_PASSWORD", "your_password")
 DEFAULT_CATEGORY = os.environ.get("DEFAULT_CATEGORY", "Khác")
 CRON_SECRET = os.environ.get("CRON_SECRET", "mat_khau_bao_ve_link")
 
-# Bật True để bọc ảnh qua CDN wsrv.nl giúp vượt chặn Hotlink 100%
 USE_IMAGE_PROXY = True
 
 RSS_FEEDS = [
@@ -99,34 +99,40 @@ MAX_POSTS_PER_RUN = 2
 # =====================================================
 
 
+def clean_html_entities(text):
+    """Giải mã triệt để các ký tự HTML bị mã hóa kép như &amp;apos;, &apos;, &quot;, &#39;."""
+    if not text:
+        return ""
+    for _ in range(3):
+        unescaped = html.unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+    return text.replace("\xa0", " ").strip()
+
+
 def clean_and_proxy_img_url(img_url, base_url):
-    """Chuẩn hóa URL ảnh và bọc qua Proxy CDN để không bị lỗi Hotlink hoặc vỡ Markdown."""
     if not img_url:
         return ""
-    img_url = img_url.strip()
+    img_url = html.unescape(img_url.strip())
 
-    # Loại bỏ ảnh rỗng base64 hoặc icon rác
     if img_url.startswith("data:") or any(
         bad in img_url.lower() for bad in ["blank.gif", "loading", "avatar", "icon", "logo", "1x1"]
     ):
         return ""
 
-    # Nếu là chuỗi srcset (chứa '1x', '2x' hoặc dấu phẩy), chỉ lấy URL đầu tiên
     if " " in img_url or "," in img_url:
         first_part = img_url.split(",")[0].strip().split(" ")[0].strip()
         if first_part.startswith("http") or first_part.startswith("/"):
             img_url = first_part
 
-    # Chuyển đường dẫn tương đối (/uploads/...) thành tuyệt đối (https://...)
     if img_url.startswith("//"):
         img_url = "https:" + img_url
     elif not img_url.startswith("http"):
         img_url = urljoin(base_url, img_url)
 
-    # Mã hóa khoảng trắng hoặc dấu ngoặc để không làm gãy cú pháp Markdown ![](url)
     img_url = img_url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
-    # Bọc qua wsrv.nl để vượt tường lửa chặn hotlink của các trang báo
     if USE_IMAGE_PROXY and not img_url.startswith("https://wsrv.nl/"):
         return f"https://wsrv.nl/?url={quote(img_url, safe='')}"
 
@@ -134,11 +140,9 @@ def clean_and_proxy_img_url(img_url, base_url):
 
 
 def preprocess_html_images(raw_html, base_url):
-    """Bóc toàn bộ ảnh ẩn trong lazy-load (data-src, data-original, picture) thành thẻ img chuẩn."""
     try:
         tree = lxml_html.fromstring(raw_html)
 
-        # 1. Xử lý thẻ <picture> (VnExpress, Dân Trí, Tuổi Trẻ hay dùng)
         for picture in tree.xpath("//picture"):
             real_url = ""
             for source in picture.xpath(".//source"):
@@ -157,7 +161,6 @@ def preprocess_html_images(raw_html, base_url):
             if img_tag is not None and real_url:
                 img_tag.set("src", real_url)
 
-        # 2. Xử lý toàn bộ thẻ <img> dùng lazy-load
         lazy_attrs = [
             "data-original",
             "data-src",
@@ -181,10 +184,9 @@ def preprocess_html_images(raw_html, base_url):
                         break
 
             if best_url:
-                img.attrib.clear()  # Xóa các thuộc tính rác để trafilatura đọc chuẩn
+                img.attrib.clear()
                 img.set("src", best_url)
             else:
-                # Xóa thẻ img rỗng để không hiện icon ảnh lỗi trong bài
                 img.getparent().remove(img)
 
         return lxml_html.tostring(tree, encoding="unicode")
@@ -198,7 +200,9 @@ def get_existing_posts(server):
         recent_posts = server.metaWeblog.getRecentPosts(
             "1", TYPECHO_USERNAME, TYPECHO_PASSWORD, 40
         )
-        existing_titles = {post.get("title", "").strip() for post in recent_posts}
+        existing_titles = {
+            clean_html_entities(post.get("title", "")) for post in recent_posts
+        }
         existing_bodies = " ".join(post.get("description", "") for post in recent_posts)
         return existing_titles, existing_bodies
     except Exception as e:
@@ -223,7 +227,7 @@ def extract_smart_tags(title, content, rss_entry):
 
     if "tags" in rss_entry:
         for t in rss_entry.tags:
-            term = t.get("term", "").strip()
+            term = clean_html_entities(t.get("term", ""))
             if 2 <= len(term) <= 25 and term not in found_tags:
                 found_tags.append(term)
 
@@ -236,14 +240,11 @@ def extract_smart_tags(title, content, rss_entry):
 
 
 def get_first_image(markdown_text, raw_html, rss_entry, base_url):
-    """Tìm ảnh đại diện (thumb) hợp lệ đầu tiên."""
-    # 1. Tìm trong nội dung Markdown đã qua xử lý
     md_images = re.findall(r"!\[.*?\]\((https?://[^\s\)]+)\)", markdown_text or "")
     for img in md_images:
         if img.startswith("http"):
             return img
 
-    # 2. Lấy từ thẻ meta og:image của trang báo
     if raw_html:
         meta = trafilatura.extract_metadata(raw_html)
         if meta and meta.image:
@@ -251,7 +252,6 @@ def get_first_image(markdown_text, raw_html, rss_entry, base_url):
             if cleaned:
                 return cleaned
 
-    # 3. Lấy từ ảnh trong RSS Feed
     summary = rss_entry.get("summary", "") or rss_entry.get("description", "")
     rss_img = re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', summary)
     if rss_img:
@@ -267,7 +267,6 @@ def extract_article_and_thumb(url, rss_entry):
     if not downloaded:
         return None, ""
 
-    # Tiền xử lý HTML để mở khóa toàn bộ ảnh lazy-load trước khi giao cho trafilatura
     fixed_html = preprocess_html_images(downloaded, url)
 
     content = trafilatura.extract(
@@ -280,8 +279,8 @@ def extract_article_and_thumb(url, rss_entry):
     if not content:
         return None, ""
 
-    # Dọn dẹp lại các thẻ ảnh rỗng (nếu còn sót) trong Markdown
     content = re.sub(r"!\[.*?\]\(data:image[^\)]+\)", "", content)
+    content = clean_html_entities(content)
 
     thumb_url = get_first_image(content, downloaded, rss_entry, url)
 
@@ -310,7 +309,8 @@ def run_leech():
                 return posted_list
 
             url = entry.get("link", "").strip()
-            title = entry.get("title", "").strip()
+            # Giải mã các thực thể HTML bị lỗi ngay từ lúc đọc tiêu đề RSS
+            title = clean_html_entities(entry.get("title", ""))
 
             if not url or not title:
                 continue
