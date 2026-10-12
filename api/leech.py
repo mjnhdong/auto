@@ -4,9 +4,10 @@ import json
 import random
 import xmlrpc.client
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin, quote
 import feedparser
 import trafilatura
+from lxml import html as lxml_html
 
 # ================= CẤU HÌNH HỆ THỐNG =================
 TYPECHO_XMLRPC_URL = os.environ.get("TYPECHO_XMLRPC_URL", "https://your-domain.com/action/xmlrpc")
@@ -15,7 +16,9 @@ TYPECHO_PASSWORD = os.environ.get("TYPECHO_PASSWORD", "your_password")
 DEFAULT_CATEGORY = os.environ.get("DEFAULT_CATEGORY", "Khác")
 CRON_SECRET = os.environ.get("CRON_SECRET", "mat_khau_bao_ve_link")
 
-# Danh sách RSS các trang công nghệ hàng đầu Việt Nam
+# Bật True để bọc ảnh qua CDN wsrv.nl giúp vượt chặn Hotlink 100%
+USE_IMAGE_PROXY = True
+
 RSS_FEEDS = [
     "https://vnexpress.net/rss/so-hoa.rss",
     "https://genk.vn/trang-chu.rss",
@@ -29,15 +32,12 @@ RSS_FEEDS = [
     "https://tinhte.vn/rss",
 ]
 
-# Từ khóa chặn: Nếu tiêu đề chứa các từ này thì bỏ qua (tránh bài PR/khuyến mãi rác)
 BLACKLIST_WORDS = [
     "mã giảm giá", "voucher", "săn sale", "shopee", "lazada", "tiki",
     "khuyến mãi", "giảm sốc", "xả kho", "tuyển dụng", "quảng cáo"
 ]
 
-# Bộ từ điển tự động nhận diện Tag (Từ khóa xuất hiện trong bài -> Tên Tag trên Typecho)
 KEYWORD_DICTIONARY = {
-    # Trí tuệ nhân tạo
     "ai": "AI",
     "trí tuệ nhân tạo": "AI",
     "chatgpt": "ChatGPT",
@@ -46,9 +46,6 @@ KEYWORD_DICTIONARY = {
     "claude": "Claude AI",
     "deepseek": "DeepSeek",
     "copilot": "Copilot",
-    "llm": "Mô hình ngôn ngữ lớn",
-
-    # Hãng công nghệ & Thiết bị
     "apple": "Apple",
     "iphone": "iPhone",
     "ipad": "iPad",
@@ -57,31 +54,23 @@ KEYWORD_DICTIONARY = {
     "samsung": "Samsung",
     "galaxy": "Samsung Galaxy",
     "xiaomi": "Xiaomi",
-    "redmi": "Xiaomi",
     "oppo": "OPPO",
     "vivo": "Vivo",
     "huawei": "Huawei",
     "realme": "Realme",
     "sony": "Sony",
-    "pixel": "Google Pixel",
     "android": "Android",
-
-    # Máy tính, Phần cứng & Chip
     "nvidia": "NVIDIA",
     "intel": "Intel",
     "amd": "AMD",
     "qualcomm": "Qualcomm",
     "snapdragon": "Snapdragon",
     "bán dẫn": "Chip bán dẫn",
-    "vi xử lý": "Vi xử lý",
     "windows": "Windows",
     "microsoft": "Microsoft",
     "linux": "Linux",
     "laptop": "Laptop",
-    "card đồ họa": "GPU",
     "rtx": "GPU",
-
-    # Bảo mật, Lập trình & Mạng
     "hacker": "An ninh mạng",
     "mã độc": "An ninh mạng",
     "bảo mật": "Bảo mật",
@@ -89,7 +78,6 @@ KEYWORD_DICTIONARY = {
     "5g": "Mạng 5G",
     "6g": "Mạng 6G",
     "starlink": "Starlink",
-    "elon musk": "Elon Musk",
     "google": "Google",
     "facebook": "Facebook",
     "meta": "Meta",
@@ -97,18 +85,12 @@ KEYWORD_DICTIONARY = {
     "youtube": "YouTube",
     "zalo": "Zalo",
     "telegram": "Telegram",
-
-    # Xe điện & Gaming
     "vinfast": "VinFast",
     "tesla": "Tesla",
     "xe điện": "Xe điện",
-    "byd": "Xe điện",
-    "playstation": "PlayStation",
     "ps5": "PS5",
-    "nintendo": "Nintendo",
     "steam": "Gaming",
     "game": "Gaming",
-    "esports": "eSports",
     "bitcoin": "Crypto",
     "blockchain": "Blockchain",
 }
@@ -117,8 +99,101 @@ MAX_POSTS_PER_RUN = 2
 # =====================================================
 
 
+def clean_and_proxy_img_url(img_url, base_url):
+    """Chuẩn hóa URL ảnh và bọc qua Proxy CDN để không bị lỗi Hotlink hoặc vỡ Markdown."""
+    if not img_url:
+        return ""
+    img_url = img_url.strip()
+
+    # Loại bỏ ảnh rỗng base64 hoặc icon rác
+    if img_url.startswith("data:") or any(
+        bad in img_url.lower() for bad in ["blank.gif", "loading", "avatar", "icon", "logo", "1x1"]
+    ):
+        return ""
+
+    # Nếu là chuỗi srcset (chứa '1x', '2x' hoặc dấu phẩy), chỉ lấy URL đầu tiên
+    if " " in img_url or "," in img_url:
+        first_part = img_url.split(",")[0].strip().split(" ")[0].strip()
+        if first_part.startswith("http") or first_part.startswith("/"):
+            img_url = first_part
+
+    # Chuyển đường dẫn tương đối (/uploads/...) thành tuyệt đối (https://...)
+    if img_url.startswith("//"):
+        img_url = "https:" + img_url
+    elif not img_url.startswith("http"):
+        img_url = urljoin(base_url, img_url)
+
+    # Mã hóa khoảng trắng hoặc dấu ngoặc để không làm gãy cú pháp Markdown ![](url)
+    img_url = img_url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+    # Bọc qua wsrv.nl để vượt tường lửa chặn hotlink của các trang báo
+    if USE_IMAGE_PROXY and not img_url.startswith("https://wsrv.nl/"):
+        return f"https://wsrv.nl/?url={quote(img_url, safe='')}"
+
+    return img_url
+
+
+def preprocess_html_images(raw_html, base_url):
+    """Bóc toàn bộ ảnh ẩn trong lazy-load (data-src, data-original, picture) thành thẻ img chuẩn."""
+    try:
+        tree = lxml_html.fromstring(raw_html)
+
+        # 1. Xử lý thẻ <picture> (VnExpress, Dân Trí, Tuổi Trẻ hay dùng)
+        for picture in tree.xpath("//picture"):
+            real_url = ""
+            for source in picture.xpath(".//source"):
+                srcset = (
+                    source.get("data-srcset")
+                    or source.get("srcset")
+                    or source.get("data-src")
+                    or ""
+                )
+                cleaned = clean_and_proxy_img_url(srcset, base_url)
+                if cleaned:
+                    real_url = cleaned
+                    break
+
+            img_tag = picture.find(".//img")
+            if img_tag is not None and real_url:
+                img_tag.set("src", real_url)
+
+        # 2. Xử lý toàn bộ thẻ <img> dùng lazy-load
+        lazy_attrs = [
+            "data-original",
+            "data-src",
+            "data-lazy-src",
+            "data-hi-res-src",
+            "data-url",
+            "data-lazyload",
+            "data-srcset",
+            "srcset",
+            "src",
+        ]
+
+        for img in tree.xpath("//img"):
+            best_url = ""
+            for attr in lazy_attrs:
+                val = img.get(attr)
+                if val:
+                    cleaned = clean_and_proxy_img_url(val, base_url)
+                    if cleaned:
+                        best_url = cleaned
+                        break
+
+            if best_url:
+                img.attrib.clear()  # Xóa các thuộc tính rác để trafilatura đọc chuẩn
+                img.set("src", best_url)
+            else:
+                # Xóa thẻ img rỗng để không hiện icon ảnh lỗi trong bài
+                img.getparent().remove(img)
+
+        return lxml_html.tostring(tree, encoding="unicode")
+    except Exception as e:
+        print(f"Lỗi tiền xử lý ảnh HTML: {e}")
+        return raw_html
+
+
 def get_existing_posts(server):
-    """Lấy 40 bài gần nhất trên Typecho để kiểm tra trùng lặp."""
     try:
         recent_posts = server.metaWeblog.getRecentPosts(
             "1", TYPECHO_USERNAME, TYPECHO_PASSWORD, 40
@@ -132,57 +207,57 @@ def get_existing_posts(server):
 
 
 def is_blacklisted(title):
-    """Kiểm tra xem tiêu đề có chứa từ khóa quảng cáo/săn sale không."""
     title_lower = title.lower()
     return any(bad_word in title_lower for bad_word in BLACKLIST_WORDS)
 
 
 def extract_smart_tags(title, content, rss_entry):
-    """Tự động quét tiêu đề, nội dung và RSS tags để tạo bộ từ khóa chuẩn SEO."""
     found_tags = []
-    # Quét trên tiêu đề (ưu tiên cao) và 1500 ký tự đầu của bài viết
     search_text = f"{title} {content[:1500]}".lower()
 
     for keyword, tag_label in KEYWORD_DICTIONARY.items():
-        # Dùng regex \b để bắt chính xác từ (tránh bắt nhầm chữ 'ai' trong 'tương lai')
         pattern = r"\b" + re.escape(keyword) + r"\b"
         if re.search(pattern, search_text):
             if tag_label not in found_tags:
                 found_tags.append(tag_label)
 
-    # Lấy thêm tag gốc từ RSS Feed (nếu trang báo có cung cấp)
     if "tags" in rss_entry:
         for t in rss_entry.tags:
             term = t.get("term", "").strip()
             if 2 <= len(term) <= 25 and term not in found_tags:
                 found_tags.append(term)
 
-    # Luôn đảm bảo có ít nhất 2 tag mặc định nếu không bắt được từ khóa riêng
     if not found_tags:
         found_tags = ["Công nghệ", "Tin công nghệ"]
     else:
         found_tags.append("Công nghệ")
 
-    # Giới hạn tối đa 6 tag mỗi bài để giao diện Typecho gọn đẹp
     return ", ".join(found_tags[:6])
 
 
-def get_first_image(markdown_text, downloaded_html, rss_entry):
-    """Tìm ảnh đầu tiên hợp lệ từ bài viết, og:image hoặc RSS summary."""
+def get_first_image(markdown_text, raw_html, rss_entry, base_url):
+    """Tìm ảnh đại diện (thumb) hợp lệ đầu tiên."""
+    # 1. Tìm trong nội dung Markdown đã qua xử lý
     md_images = re.findall(r"!\[.*?\]\((https?://[^\s\)]+)\)", markdown_text or "")
     for img in md_images:
-        if not img.startswith("data:image") and not any(x in img.lower() for x in ["icon", "logo", "avatar", "pixel"]):
+        if img.startswith("http"):
             return img
 
-    if downloaded_html:
-        meta = trafilatura.extract_metadata(downloaded_html)
-        if meta and meta.image and meta.image.startswith("http"):
-            return meta.image
+    # 2. Lấy từ thẻ meta og:image của trang báo
+    if raw_html:
+        meta = trafilatura.extract_metadata(raw_html)
+        if meta and meta.image:
+            cleaned = clean_and_proxy_img_url(meta.image, base_url)
+            if cleaned:
+                return cleaned
 
+    # 3. Lấy từ ảnh trong RSS Feed
     summary = rss_entry.get("summary", "") or rss_entry.get("description", "")
     rss_img = re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', summary)
     if rss_img:
-        return rss_img.group(1)
+        cleaned = clean_and_proxy_img_url(rss_img.group(1), base_url)
+        if cleaned:
+            return cleaned
 
     return ""
 
@@ -192,8 +267,11 @@ def extract_article_and_thumb(url, rss_entry):
     if not downloaded:
         return None, ""
 
+    # Tiền xử lý HTML để mở khóa toàn bộ ảnh lazy-load trước khi giao cho trafilatura
+    fixed_html = preprocess_html_images(downloaded, url)
+
     content = trafilatura.extract(
-        downloaded,
+        fixed_html,
         output_format="markdown",
         include_images=True,
         include_links=True,
@@ -202,7 +280,10 @@ def extract_article_and_thumb(url, rss_entry):
     if not content:
         return None, ""
 
-    thumb_url = get_first_image(content, downloaded, rss_entry)
+    # Dọn dẹp lại các thẻ ảnh rỗng (nếu còn sót) trong Markdown
+    content = re.sub(r"!\[.*?\]\(data:image[^\)]+\)", "", content)
+
+    thumb_url = get_first_image(content, downloaded, rss_entry, url)
 
     if thumb_url and thumb_url not in content:
         content = f"![]({thumb_url})\n\n{content}"
@@ -215,7 +296,6 @@ def run_leech():
     existing_titles, existing_bodies = get_existing_posts(server)
     posted_list = []
 
-    # Xáo trộn thứ tự các trang RSS để lấy bài đa dạng từ nhiều báo khác nhau
     feeds_to_scan = RSS_FEEDS.copy()
     random.shuffle(feeds_to_scan)
 
@@ -225,7 +305,7 @@ def run_leech():
         except Exception:
             continue
 
-        for entry in feed.entries[:6]:  # Chỉ xét 6 bài mới nhất của mỗi nguồn để tăng tốc
+        for entry in feed.entries[:6]:
             if len(posted_list) >= MAX_POSTS_PER_RUN:
                 return posted_list
 
@@ -235,11 +315,9 @@ def run_leech():
             if not url or not title:
                 continue
 
-            # 1. Bỏ qua nếu bài chứa từ khóa quảng cáo/săn sale
             if is_blacklisted(title):
                 continue
 
-            # 2. Bỏ qua nếu bài đã từng được đăng
             if title in existing_titles or url in existing_bodies:
                 continue
 
@@ -247,7 +325,6 @@ def run_leech():
             if not content or len(content.strip()) < 250:
                 continue
 
-            # 3. Tự động tạo danh sách từ khóa (Tags) theo nội dung bài
             smart_keywords = extract_smart_tags(title, content, entry)
 
             full_body = (
