@@ -10,7 +10,7 @@ import trafilatura
 TYPECHO_XMLRPC_URL = os.environ.get("TYPECHO_XMLRPC_URL", "[https://your-domain.com/action/xmlrpc](https://your-domain.com/action/xmlrpc)")
 TYPECHO_USERNAME = os.environ.get("TYPECHO_USERNAME", "admin")
 TYPECHO_PASSWORD = os.environ.get("TYPECHO_PASSWORD", "your_password")
-DEFAULT_CATEGORY = os.environ.get("DEFAULT_CATEGORY", "Công nghệ")
+DEFAULT_CATEGORY = os.environ.get("DEFAULT_CATEGORY", "Khác")
 CRON_SECRET = os.environ.get("CRON_SECRET", "mat_khau_bao_ve_link")
 
 RSS_FEEDS = [
@@ -80,7 +80,7 @@ def run_leech():
                 "title": title,
                 "description": full_body,
                 "categories": [DEFAULT_CATEGORY],
-                "mt_keywords": "công nghệ, tin tức",
+                "mt_keywords": "Công nghệ, Tin tức",
             }
 
             post_id = server.metaWeblog.newPost(
