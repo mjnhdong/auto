@@ -37,6 +37,29 @@ BLACKLIST_WORDS = [
     "khuyến mãi", "giảm sốc", "xả kho", "tuyển dụng", "quảng cáo"
 ]
 
+# Danh sách các từ khóa class/id HTML chứa rác (bình luận, tin liên quan, quảng cáo) cần xóa bỏ
+NOISY_HTML_SELECTORS = [
+    "comment", "binh-luan", "binhluan", "ykien", "feedback",
+    "related", "tin-lien-quan", "lien-quan", "more-news", "other-news",
+    "ck-cms-insert", "box-insert", "vcsortableinpreviewmode", "link-content-footer",
+    "box-taitro", "banner", "ads", "advertisement", "social", "share",
+    "breadcrumb", "tags", "tag-list", "box-author", " polling", "vote"
+]
+
+# Các câu rác thường gặp ở cuối bài báo cần xóa khỏi Markdown
+NOISY_TEXT_PATTERNS = [
+    r"(?i)^tối đa\s*:?\s*$",
+    r"(?i)^\d+\s*ký tự\s*$",
+    r"(?i).*hiện chưa có bình luận nào.*",
+    r"(?i).*hãy là người đầu tiên bình luận.*",
+    r"(?i).*ý kiến bạn đọc.*",
+    r"(?i).*gửi bình luận.*",
+    r"(?i).*đăng nhập để bình luận.*",
+    r"(?i)^(xem thêm|đọc thêm|tin liên quan|bài viết liên quan)\s*:?.*$",
+    r"(?i).*mời độc giả xem thêm.*",
+    r"(?i).*theo dõi .* trên google news.*",
+]
+
 KEYWORD_DICTIONARY = {
     "ai": "AI",
     "trí tuệ nhân tạo": "AI",
@@ -139,10 +162,29 @@ def clean_and_proxy_img_url(img_url, base_url):
     return img_url
 
 
-def preprocess_html_images(raw_html, base_url):
+def preprocess_html_dom(raw_html, base_url):
+    """Xóa các thẻ HTML rác (bình luận, tin liên quan, footer) và chuẩn hóa ảnh lazy-load."""
     try:
         tree = lxml_html.fromstring(raw_html)
 
+        # 1. Xóa các thẻ form,输入, button, iframe, footer, aside, nav
+        for bad_tag in tree.xpath("//form | //textarea | //button | //input | //footer | //aside | //nav | //script | //style"):
+            if bad_tag.getparent() is not None:
+                bad_tag.getparent().remove(bad_tag)
+
+        # 2. Xóa các khối div/section có class hoặc id chứa từ khóa bình luận / tin liên quan
+        for el in tree.xpath("//*[@class or @id or @data-role or @type]"):
+            attr_str = (
+                f"{el.get('class', '')} {el.get('id', '')} "
+                f"{el.get('data-role', '')} {el.get('type', '')}"
+            ).lower()
+            if any(noise in attr_str for noise in NOISY_HTML_SELECTORS):
+                # Không xóa nhầm thẻ <body> hoặc <article> chính của trang
+                if el.tag not in ("html", "body", "main", "article"):
+                    if el.getparent() is not None:
+                        el.getparent().remove(el)
+
+        # 3. Xử lý thẻ <picture>
         for picture in tree.xpath("//picture"):
             real_url = ""
             for source in picture.xpath(".//source"):
@@ -161,6 +203,7 @@ def preprocess_html_images(raw_html, base_url):
             if img_tag is not None and real_url:
                 img_tag.set("src", real_url)
 
+        # 4. Xử lý toàn bộ thẻ <img> dùng lazy-load
         lazy_attrs = [
             "data-original",
             "data-src",
@@ -187,12 +230,41 @@ def preprocess_html_images(raw_html, base_url):
                 img.attrib.clear()
                 img.set("src", best_url)
             else:
-                img.getparent().remove(img)
+                if img.getparent() is not None:
+                    img.getparent().remove(img)
 
         return lxml_html.tostring(tree, encoding="unicode")
     except Exception as e:
-        print(f"Lỗi tiền xử lý ảnh HTML: {e}")
+        print(f"Lỗi tiền xử lý HTML: {e}")
         return raw_html
+
+
+def clean_article_noise(markdown_text):
+    """Lọc bỏ các dòng văn bản rác (khung bình luận, link bài liên quan đứng lẻ) trong Markdown."""
+    lines = markdown_text.splitlines()
+    cleaned_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+
+        # Bỏ qua các câu rác của khung bình luận (Tối đa: 1500 ký tự, Hiện chưa có bình luận nào...)
+        if any(re.match(pattern, stripped) for pattern in NOISY_TEXT_PATTERNS):
+            continue
+
+        # Bỏ qua dòng chỉ chứa duy nhất 1 đường link bài viết liên quan đứng trơ trọi
+        # (Ví dụ: [Đạo diễn 'Gái già lắm chiêu' bị kẻ gian...](https://...))
+        if re.match(r"^\[[^\]]+\]\(https?://[^\)]+\)$", stripped):
+            continue
+
+        cleaned_lines.append(line)
+
+    # Gộp các dòng trống liên tiếp (tối đa 2 dòng xuống hàng)
+    result = "\n".join(cleaned_lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 def get_existing_posts(server):
@@ -267,20 +339,26 @@ def extract_article_and_thumb(url, rss_entry):
     if not downloaded:
         return None, ""
 
-    fixed_html = preprocess_html_images(downloaded, url)
+    # 1. Dọn dẹp DOM HTML trước khi đưa vào trafilatura
+    fixed_html = preprocess_html_dom(downloaded, url)
 
+    # 2. Tắt include_comments và bật favor_precision để không quét nhầm phần cuối trang
     content = trafilatura.extract(
         fixed_html,
         output_format="markdown",
+        include_comments=False,
         include_images=True,
         include_links=True,
         include_tables=True,
+        favor_precision=True,
     )
     if not content:
         return None, ""
 
+    # 3. Làm sạch thực thể HTML và cắt bỏ các dòng rác còn sót
     content = re.sub(r"!\[.*?\]\(data:image[^\)]+\)", "", content)
     content = clean_html_entities(content)
+    content = clean_article_noise(content)
 
     thumb_url = get_first_image(content, downloaded, rss_entry, url)
 
@@ -309,7 +387,6 @@ def run_leech():
                 return posted_list
 
             url = entry.get("link", "").strip()
-            # Giải mã các thực thể HTML bị lỗi ngay từ lúc đọc tiêu đề RSS
             title = clean_html_entities(entry.get("title", ""))
 
             if not url or not title:
